@@ -1,0 +1,640 @@
+"""Search for alternative routes given a nuPlan scenario.
+
+An **alternative route** is a path through the map's roadblock graph that diverges from the
+scenario's original route at a junction close ahead of the ego (within
+``divergence_max_distance_m``), then continues far enough that the ego needs roughly
+``goal_time_s`` seconds of driving to reach a new goal position.
+
+The original route is derived as a clean, connected roadblock chain straight from the expert
+future trajectory via nuplan's :func:`get_roadblock_ids_from_trajectory` (no correction needed).
+Roadblocks alternate between ``ROADBLOCK`` and ``ROADBLOCK_CONNECTOR`` segments;
+``roadblock.outgoing_edges`` gives the next roadblock(s), so a junction with more than one
+outgoing edge is a divergence point. A lane is "on route" iff its parent roadblock is on the
+route, which is why routes are expressed at the roadblock level. Alternative routes are likewise
+built by graph traversal, so they are connected by construction and need no post-hoc correction.
+
+The result is a list of :class:`AlternativeRoute`, each carrying the full roadblock-id sequence
+(ego -> goal) and the new goal pose. If the ego can only continue straight (no divergence within
+the distance budget), an empty list is returned and the scenario should be skipped.
+"""
+
+from __future__ import annotations
+
+import math
+from typing import List, Optional, Tuple
+
+from nuplan.common.actor_state.state_representation import Point2D, StateSE2
+from nuplan.common.maps.abstract_map import AbstractMap
+from nuplan.common.maps.abstract_map_objects import (
+    LaneGraphEdgeMapObject,
+    RoadBlockGraphEdgeMapObject,
+)
+from nuplan.common.maps.maps_datatypes import SemanticMapLayer
+from nuplan.common.maps.nuplan_map.utils import get_roadblock_ids_from_trajectory
+from nuplan.planning.scenario_builder.nuplan_db.nuplan_scenario import NuPlanScenario
+
+# (x, y, heading) goal pose.
+Pose = Tuple[float, float, float]
+
+
+def _normalize_angle(angle: float) -> float:
+    """Wrap an angle to [-pi, pi)."""
+    return (angle + math.pi) % (2 * math.pi) - math.pi
+
+
+def extract_original_route(
+    scenario: NuPlanScenario,
+    *,
+    goal_time_s: float = 60.0,
+    default_speed_mps: float = 10.0,
+    min_speed_mps: float = 2.0,
+    max_roadblocks: int = 300,
+) -> List[str]:
+    """Return the ego's original route as a clean, connected list of roadblock ids.
+
+    The route is anchored at the roadblock the ego currently sits on (found from a single-point
+    trajectory query, which is robust even at a standstill) and walked forward through the
+    roadblock graph up to a ~``goal_time_s`` driving budget. At each junction the branch that lies
+    on the scenario's stored **mission route** is preferred (straightest among ties); if the
+    mission route has run out, the straightest continuation is taken.
+
+    This is deliberately *not* taken from the expert's future trajectory alone: when the ego is
+    stopped (e.g. waiting at a light) that trajectory covers a single roadblock, which both hides
+    the intended route and — worse — leaves the on-route branch unknown, so the alternative search
+    could not tell a genuine alternative from the original. Laying the route out along the stored
+    mission with speed-limit timing fixes both. The result is connected and ego-aligned by
+    construction, so it needs no correction. This is the route the alternative search diverges from.
+    """
+    map_api: AbstractMap = scenario.map_api
+    ego_state = scenario.initial_ego_state
+    ego_point = ego_state.rear_axle.point
+
+    stored = [rid for rid in scenario.get_route_roadblock_ids() if rid]
+    stored_set = set(stored)
+
+    # Start roadblock: where the ego is right now (single-point query survives a standstill).
+    start_ids = get_roadblock_ids_from_trajectory(map_api, [ego_state])
+    start_id = start_ids[0] if start_ids else (stored[0] if stored else None)
+    rb = _get_roadblock(map_api, start_id) if start_id else None
+    if rb is None:
+        return list(stored)
+
+    route_ids = [rb.id]
+    visited = {rb.id}
+    prev_lane = _nearest_lane(rb, ego_point)
+
+    # Time already used up on the ego's current block (from the ego's arc position to its end).
+    cum_time = 0.0
+    if prev_lane is not None:
+        covered = prev_lane.baseline_path.get_nearest_arc_length_from_position(ego_point)
+        remaining = max(prev_lane.baseline_path.length - covered, 0.0)
+        cum_time += remaining / _lane_speed(prev_lane, default_speed_mps, min_speed_mps)
+
+    while cum_time < goal_time_s and len(route_ids) < max_roadblocks:
+        candidates = [e for e in rb.outgoing_edges if e.id not in visited]
+        if not candidates:
+            break
+        on_route = [e for e in candidates if e.id in stored_set]
+        pool = on_route or candidates
+        ref_heading = (
+            prev_lane.baseline_path.discrete_path[-1].heading if prev_lane is not None else None
+        )
+        if ref_heading is None:
+            nxt = pool[0]
+        else:
+            nxt = min(pool, key=lambda e: _branch_misalignment(e, prev_lane, ref_heading))
+        lane = _straightest_lane(nxt, prev_lane)
+        if lane is None:
+            break
+        route_ids.append(nxt.id)
+        visited.add(nxt.id)
+        cum_time += lane.baseline_path.length / _lane_speed(lane, default_speed_mps, min_speed_mps)
+        rb, prev_lane = nxt, lane
+
+    return route_ids
+
+
+def route_end_pose(
+    map_api: AbstractMap, roadblock_ids: List[str]
+) -> Optional[Tuple[float, float, float]]:
+    """Return an ``(x, y, heading)`` pose at the end of a route (its last lane's last point).
+
+    Walks the roadblocks picking the straightest connected lane at each step, so the endpoint is
+    a sensible "where does this route lead" marker for visualization.
+    """
+    prev_lane: Optional[LaneGraphEdgeMapObject] = None
+    for rid in roadblock_ids:
+        rb = _get_roadblock(map_api, rid)
+        if rb is None:
+            continue
+        lane = _straightest_lane(rb, prev_lane)
+        if lane is None:
+            break
+        prev_lane = lane
+    if prev_lane is None:
+        return None
+    p = prev_lane.baseline_path.discrete_path[-1]
+    return (p.x, p.y, p.heading)
+
+
+def route_lanes(map_api: AbstractMap, roadblock_ids: List[str]) -> List[LaneGraphEdgeMapObject]:
+    """Expand a list of route roadblock ids into their interior **route lanes**.
+
+    A route is expressed at the roadblock level; a lane is "on route" iff its parent roadblock is
+    on the route. This resolves each roadblock id and returns all of its interior lanes, in route
+    order (roadblocks that don't resolve are skipped).
+    """
+    lanes: List[LaneGraphEdgeMapObject] = []
+    for rid in roadblock_ids:
+        rb = _get_roadblock(map_api, rid)
+        if rb is not None:
+            lanes.extend(rb.interior_edges)
+    return lanes
+
+
+def search_alternative_routes(
+    scenario: NuPlanScenario,
+    max_alternatives: int = 3,
+    *,
+    divergence_max_distance_m: float = 50.0,
+    goal_time_s: float = 60.0,
+    min_goal_time_s: float = 0.0,
+    default_speed_mps: float = 10.0,
+    min_speed_mps: float = 2.0,
+) -> List["AlternativeRoute"]:
+    """Find alternative routes for a scenario as a small route tree.
+
+    All non-original branches at the **first** divergence junction ahead of the ego are returned
+    (level 1) — every distinct option there is kept, even beyond ``max_alternatives``. If the first
+    junction yields fewer than ``max_alternatives``, the result is topped up (level 2) from the next
+    junction along each already-found alternative, in order, until the cap is reached. So the count
+    is ``max(#first-junction options, min(max_alternatives, #reachable))``: more than
+    ``max_alternatives`` only when the first junction alone provides them.
+
+    Args:
+        scenario: The loaded nuPlan scenario (ego states, map API, mission goal, route).
+        max_alternatives: Target/cap for the total number of alternatives. First-junction options
+            are always all kept even if they exceed this; it only bounds the level-2 top-up.
+        divergence_max_distance_m: Soft upper bound (from 0m) on how far ahead of the ego the
+            first divergence junction may be for alternatives to be searched.
+        goal_time_s: Soft target driving time from the ego to the alternative goal (~1 min). If a
+            branch dead-ends before this, the alternative is still emitted, with the achievable
+            ``goal_distance_m`` / ``est_travel_time_s`` recorded in its meta.
+        min_goal_time_s: Optional floor (default 0 = off) to drop trivially short spur branches
+            that reach less than this many seconds of driving.
+        default_speed_mps: Fallback speed for lanes with no speed limit, for time estimates.
+        min_speed_mps: Lower clamp on lane speed to avoid division blow-ups on 0-limit lanes.
+
+    Returns:
+        Up to ``max_alternatives`` :class:`AlternativeRoute` objects (empty if the ego can only
+        continue along the original route).
+    """
+    # Imported here to keep the module importable without the package installed as a whole.
+    from .alternative_routes import AlternativeRoute
+
+    map_api: AbstractMap = scenario.map_api
+    ego_state = scenario.initial_ego_state
+    ego_pose: StateSE2 = ego_state.rear_axle
+    ego_point = ego_pose.point
+
+    # Build the ego's original route as a clean, connected roadblock chain straight from the
+    # expert future trajectory (nuplan's own extractor -> already connected, ego-aligned, no
+    # correction needed). This defines both the ego's starting roadblock and the branch the
+    # expert takes at each junction (the branch alternatives must differ from).
+    route = extract_original_route(
+        scenario,
+        goal_time_s=goal_time_s,
+        default_speed_mps=default_speed_mps,
+        min_speed_mps=min_speed_mps,
+    )
+    if not route:
+        return []
+
+    # Resolve to objects, preserving order and dropping any that don't resolve.
+    route_dict = {rid: _get_roadblock(map_api, rid) for rid in route}
+    route_dict = {rid: rb for rid, rb in route_dict.items() if rb is not None}
+    if not route_dict:
+        return []
+    route = list(route_dict.keys())
+    starting_block = route_dict[route[0]]
+
+    # How far along the starting roadblock the ego already is (arc length on its nearest lane).
+    start_lane = _nearest_lane(starting_block, ego_point)
+    ego_covered_m = (
+        start_lane.baseline_path.get_nearest_arc_length_from_position(ego_point)
+        if start_lane is not None
+        else 0.0
+    )
+
+    # --- Find the FIRST divergence junction along the original route (nearest the ego, within the
+    # distance budget). Every alternative branches from here; if there are too few, we top up from
+    # the next junction along one of those branches (a small route tree, not a full enumeration). ---
+    first_div: Optional[_Divergence] = None
+    cum_dist = 0.0
+    cum_time = 0.0
+    prev_lane: Optional[LaneGraphEdgeMapObject] = None
+    for i, rb_id in enumerate(route):
+        rb = route_dict.get(rb_id) or _get_roadblock(map_api, rb_id)
+        if rb is None:
+            break
+        lane = (
+            start_lane
+            if i == 0 and start_lane is not None
+            else _straightest_lane(rb, prev_lane)
+        )
+        if lane is None:
+            break
+        block_len = lane.baseline_path.length
+        remaining = block_len - ego_covered_m if i == 0 else block_len
+        remaining = max(remaining, 0.0)
+        block_time = remaining / _lane_speed(lane, default_speed_mps, min_speed_mps)
+
+        cum_dist_end = cum_dist + remaining
+        cum_time_end = cum_time + block_time
+        next_id = route[i + 1] if i + 1 < len(route) else None
+        alt_branches = [e for e in rb.outgoing_edges if e.id != next_id]
+
+        if alt_branches and cum_dist_end <= divergence_max_distance_m:
+            first_div = _Divergence(
+                prefix_ids=route[: i + 1],
+                prefix_time_s=cum_time_end,
+                junction_lane=lane,
+                on_route_next_id=next_id,
+                branches=alt_branches,
+                distance_m=cum_dist_end,
+            )
+            break
+
+        cum_dist, cum_time = cum_dist_end, cum_time_end
+        prev_lane = lane
+        if cum_dist > divergence_max_distance_m:
+            break
+
+    if first_div is None:
+        return []
+
+    alternatives: List[AlternativeRoute] = []
+    seen_finals: set[str] = set()
+
+    # --- Level 1: one alternative per branch at the first junction. ALL are kept, even beyond
+    # max_alternatives, since every distinct option at the first junction is wanted. ---
+    level1: List[Tuple[List[str], List[_Step]]] = []
+    for branch in first_div.branches:
+        steps = _straightest_extension(
+            branch,
+            start_time_s=first_div.prefix_time_s,
+            start_dist_m=first_div.distance_m,
+            visited=set(first_div.prefix_ids),
+            goal_time_s=goal_time_s,
+            default_speed_mps=default_speed_mps,
+            min_speed_mps=min_speed_mps,
+        )
+        alt = _build_alternative(
+            token=scenario.token,
+            prefix_ids=first_div.prefix_ids,
+            junction_lane=first_div.junction_lane,
+            branch=branch,
+            steps=steps,
+            divergence_distance_m=first_div.distance_m,
+            goal_time_s=goal_time_s,
+            default_speed_mps=default_speed_mps,
+            min_speed_mps=min_speed_mps,
+            min_goal_time_s=min_goal_time_s,
+        )
+        if alt is None:
+            continue
+        alternatives.append(alt)
+        seen_finals.add(alt.route_ids[-1])
+        level1.append((first_div.prefix_ids, steps))
+
+    # --- Level 2 (fill only): if the first junction gave fewer than max_alternatives, top up from
+    # the next junction along each already-found alternative, in order, until the cap is reached.
+    # This never runs when the first junction alone already meets/exceeds max_alternatives. ---
+    if len(alternatives) < max_alternatives:
+        for prefix_ids, steps in level1:
+            if len(alternatives) >= max_alternatives:
+                break
+            fork = _first_fork(steps, blocked_ids=set(prefix_ids))
+            if fork is None:
+                continue
+            idx, junction, fork_branches = fork
+            # Shared path from the ego up to and including the second-junction roadblock.
+            j2_prefix = list(prefix_ids) + [s.rb.id for s in steps[: idx + 1]]
+            j2_visited = set(j2_prefix)
+            for fbranch in fork_branches:
+                if len(alternatives) >= max_alternatives:
+                    break
+                steps2 = _straightest_extension(
+                    fbranch,
+                    start_time_s=junction.end_time,
+                    start_dist_m=junction.end_dist,
+                    visited=j2_visited,
+                    goal_time_s=goal_time_s,
+                    default_speed_mps=default_speed_mps,
+                    min_speed_mps=min_speed_mps,
+                )
+                alt2 = _build_alternative(
+                    token=scenario.token,
+                    prefix_ids=j2_prefix,
+                    junction_lane=junction.lane,
+                    branch=fbranch,
+                    steps=steps2,
+                    divergence_distance_m=junction.end_dist,
+                    goal_time_s=goal_time_s,
+                    default_speed_mps=default_speed_mps,
+                    min_speed_mps=min_speed_mps,
+                    min_goal_time_s=min_goal_time_s,
+                )
+                if alt2 is None or alt2.route_ids[-1] in seen_finals:
+                    continue
+                alternatives.append(alt2)
+                seen_finals.add(alt2.route_ids[-1])
+
+    return alternatives
+
+
+# --------------------------------------------------------------------------------------------
+# Internal helpers
+# --------------------------------------------------------------------------------------------
+
+
+class _Divergence:
+    """A junction where the ego could leave the original route."""
+
+    __slots__ = (
+        "prefix_ids",
+        "prefix_time_s",
+        "junction_lane",
+        "on_route_next_id",
+        "branches",
+        "distance_m",
+    )
+
+    def __init__(
+        self,
+        prefix_ids: List[str],
+        prefix_time_s: float,
+        junction_lane: LaneGraphEdgeMapObject,
+        on_route_next_id: Optional[str],
+        branches: List[RoadBlockGraphEdgeMapObject],
+        distance_m: float,
+    ) -> None:
+        self.prefix_ids = prefix_ids
+        self.prefix_time_s = prefix_time_s
+        self.junction_lane = junction_lane
+        self.on_route_next_id = on_route_next_id
+        self.branches = branches
+        self.distance_m = distance_m
+
+
+def _get_roadblock(
+    map_api: AbstractMap, rb_id: str
+) -> Optional[RoadBlockGraphEdgeMapObject]:
+    """Resolve a roadblock or roadblock-connector by id."""
+    rb = map_api.get_map_object(rb_id, SemanticMapLayer.ROADBLOCK)
+    return rb or map_api.get_map_object(rb_id, SemanticMapLayer.ROADBLOCK_CONNECTOR)
+
+
+def _lane_speed(
+    lane: LaneGraphEdgeMapObject, default_speed_mps: float, min_speed_mps: float
+) -> float:
+    speed = lane.speed_limit_mps or default_speed_mps
+    return max(speed, min_speed_mps)
+
+
+def _nearest_lane(
+    roadblock: RoadBlockGraphEdgeMapObject, point: Point2D
+) -> Optional[LaneGraphEdgeMapObject]:
+    """Interior lane of ``roadblock`` whose baseline passes closest to ``point``."""
+    best_lane, best_dist = None, math.inf
+    for lane in roadblock.interior_edges:
+        path = lane.baseline_path.discrete_path
+        dist = min((p.x - point.x) ** 2 + (p.y - point.y) ** 2 for p in path)
+        if dist < best_dist:
+            best_lane, best_dist = lane, dist
+    return best_lane
+
+
+def _straightest_lane(
+    roadblock: RoadBlockGraphEdgeMapObject,
+    prev_lane: Optional[LaneGraphEdgeMapObject],
+) -> Optional[LaneGraphEdgeMapObject]:
+    """Interior lane best continuing ``prev_lane``'s heading (or the first lane)."""
+    lanes = roadblock.interior_edges
+    if not lanes:
+        return None
+    if prev_lane is None:
+        return lanes[0]
+    ref_heading = prev_lane.baseline_path.discrete_path[-1].heading
+    return min(
+        lanes,
+        key=lambda ln: abs(
+            _normalize_angle(ln.baseline_path.discrete_path[0].heading - ref_heading)
+        ),
+    )
+
+
+class _Step:
+    """One roadblock along an extended route, with the lane driven and the entry/exit time+dist.
+
+    ``enter_time``/``end_time`` are measured from the ego; ``enter_dist``/``end_dist`` are the
+    travel distance accumulated from the divergence junction the extension started at.
+    """
+
+    __slots__ = ("rb", "lane", "enter_time", "end_time", "enter_dist", "end_dist")
+
+    def __init__(
+        self,
+        rb: RoadBlockGraphEdgeMapObject,
+        lane: LaneGraphEdgeMapObject,
+        enter_time: float,
+        end_time: float,
+        enter_dist: float,
+        end_dist: float,
+    ) -> None:
+        self.rb = rb
+        self.lane = lane
+        self.enter_time = enter_time
+        self.end_time = end_time
+        self.enter_dist = enter_dist
+        self.end_dist = end_dist
+
+
+def _straightest_extension(
+    branch: RoadBlockGraphEdgeMapObject,
+    start_time_s: float,
+    start_dist_m: float,
+    visited: set,
+    goal_time_s: float,
+    default_speed_mps: float,
+    min_speed_mps: float,
+    max_depth: int = 300,
+) -> List["_Step"]:
+    """Extend from ``branch`` to a ~``goal_time_s`` route via straightest-first DFS.
+
+    A greedy walk can dead-end into a short spur even when a long route exists; this DFS tries the
+    straightest continuation first but backtracks on dead-ends, returning the first path that
+    reaches ``goal_time_s`` (or the deepest one found if the local graph dead-ends earlier), as a
+    list of :class:`_Step` from ``branch`` onward.
+    """
+    best_steps: List[_Step] = []
+    best_end_time = start_time_s
+
+    def dfs(
+        rb: RoadBlockGraphEdgeMapObject,
+        prev_lane: Optional[LaneGraphEdgeMapObject],
+        cum_time: float,
+        cum_dist: float,
+        steps: List[_Step],
+        local_visited: set,
+    ) -> bool:
+        nonlocal best_steps, best_end_time
+        lane = _straightest_lane(rb, prev_lane)
+        if lane is None:
+            return False
+        seg_len = lane.baseline_path.length
+        end_time = cum_time + seg_len / _lane_speed(lane, default_speed_mps, min_speed_mps)
+        end_dist = cum_dist + seg_len
+        steps = steps + [_Step(rb, lane, cum_time, end_time, cum_dist, end_dist)]
+        if end_time > best_end_time:
+            best_end_time = end_time
+            best_steps = steps
+        if end_time >= goal_time_s or len(steps) >= max_depth:
+            return end_time >= goal_time_s
+
+        candidates = [e for e in rb.outgoing_edges if e.id not in local_visited]
+        ref_heading = lane.baseline_path.discrete_path[-1].heading
+        candidates.sort(key=lambda e: _branch_misalignment(e, lane, ref_heading))
+        for nxt in candidates:
+            if dfs(nxt, lane, end_time, end_dist, steps, local_visited | {nxt.id}):
+                return True
+        return False
+
+    dfs(branch, None, start_time_s, start_dist_m, [], visited | {branch.id})
+    return best_steps
+
+
+def _first_fork(
+    steps: List["_Step"], blocked_ids: set
+) -> Optional[Tuple[int, "_Step", List[RoadBlockGraphEdgeMapObject]]]:
+    """First step whose roadblock forks off the path (has an untaken, unvisited outgoing edge).
+
+    Returns ``(index, step, alternative branches)`` for the earliest such junction, or ``None`` if
+    the path never forks. ``blocked_ids`` are roadblocks already on the shared prefix.
+    """
+    path_ids = {s.rb.id for s in steps}
+    for i, s in enumerate(steps):
+        taken_next = steps[i + 1].rb.id if i + 1 < len(steps) else None
+        forks = [
+            e
+            for e in s.rb.outgoing_edges
+            if e.id != taken_next and e.id not in blocked_ids and e.id not in path_ids
+        ]
+        if forks:
+            return i, s, forks
+    return None
+
+
+def _build_alternative(
+    token: str,
+    prefix_ids: List[str],
+    junction_lane: LaneGraphEdgeMapObject,
+    branch: RoadBlockGraphEdgeMapObject,
+    steps: List["_Step"],
+    divergence_distance_m: float,
+    goal_time_s: float,
+    default_speed_mps: float,
+    min_speed_mps: float,
+    min_goal_time_s: float,
+):
+    """Assemble an :class:`AlternativeRoute` from a prefix + extension, or ``None`` if unusable.
+
+    The goal is placed on the final lane at the arc matching the leftover time budget; the travel
+    distance to it is the distance up to that lane plus that in-lane arc. Reaching ~``goal_time_s``
+    is a *soft* target: shorter paths are still emitted (tagged ``reached_goal_time=False``); the
+    ``min_goal_time_s`` guard (0 by default) only trims trivially short spurs when raised.
+    """
+    from .alternative_routes import AlternativeRoute
+
+    if not steps:
+        return None
+    total_time_s = steps[-1].end_time
+    if total_time_s < min_goal_time_s:
+        return None
+
+    final = steps[-1]
+    remaining_time_s = goal_time_s - final.enter_time
+    goal_arc_m = min(
+        max(remaining_time_s * _lane_speed(final.lane, default_speed_mps, min_speed_mps), 0.0),
+        final.lane.baseline_path.length,
+    )
+    goal = _pose_at_arc_length(final.lane, goal_arc_m)
+    goal_distance_m = final.enter_dist + goal_arc_m
+    ext_ids = [s.rb.id for s in steps]
+    return AlternativeRoute(
+        token=token,
+        route_ids=list(prefix_ids) + ext_ids,
+        goal_position=goal,
+        meta={
+            "divergence_distance_m": round(divergence_distance_m, 2),
+            "goal_distance_m": round(goal_distance_m, 2),
+            "est_travel_time_s": round(min(total_time_s, goal_time_s), 2),
+            "reached_goal_time": bool(total_time_s >= goal_time_s),
+            "turn": _turn_label(junction_lane, branch),
+            "num_roadblocks": len(prefix_ids) + len(ext_ids),
+        },
+    )
+
+
+def _branch_misalignment(
+    rb: RoadBlockGraphEdgeMapObject,
+    ref_lane: LaneGraphEdgeMapObject,
+    ref_heading: float,
+) -> float:
+    """Absolute heading difference between ``rb``'s straightest lane and ``ref_heading``."""
+    lane = _straightest_lane(rb, ref_lane)
+    if lane is None:
+        return math.pi
+    return abs(_normalize_angle(lane.baseline_path.discrete_path[0].heading - ref_heading))
+
+
+def _pose_at_arc_length(lane: LaneGraphEdgeMapObject, arc: float) -> Pose:
+    """Linear-interpolate the lane baseline's discrete path at arc length ``arc``."""
+    path = lane.baseline_path.discrete_path
+    if arc <= 0.0 or len(path) == 1:
+        p = path[0]
+        return (p.x, p.y, p.heading)
+    acc = 0.0
+    for a, b in zip(path, path[1:]):
+        seg = math.hypot(b.x - a.x, b.y - a.y)
+        if acc + seg >= arc:
+            t = (arc - acc) / seg if seg > 0 else 0.0
+            return (a.x + t * (b.x - a.x), a.y + t * (b.y - a.y), b.heading)
+        acc += seg
+    p = path[-1]
+    return (p.x, p.y, p.heading)
+
+
+def _turn_label(
+    junction_lane: LaneGraphEdgeMapObject,
+    branch: RoadBlockGraphEdgeMapObject,
+    threshold: float = math.pi / 8,
+) -> str:
+    """Classify a branch as ``left`` / ``right`` / ``straight`` vs. the junction heading.
+
+    Uses the *net* direction of the branch (first-to-last baseline displacement) rather than its
+    start heading, since a turn connector begins roughly aligned with the entry and only curves
+    later — comparing start headings would label every branch "straight".
+    """
+    ref = junction_lane.baseline_path.discrete_path[-1].heading
+    lane = branch.interior_edges[0] if branch.interior_edges else None
+    if lane is None:
+        return "unknown"
+    path = lane.baseline_path.discrete_path
+    net_heading = math.atan2(path[-1].y - path[0].y, path[-1].x - path[0].x)
+    delta = _normalize_angle(net_heading - ref)
+    if delta > threshold:
+        return "left"
+    if delta < -threshold:
+        return "right"
+    return "straight"

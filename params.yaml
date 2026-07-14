@@ -1,0 +1,63 @@
+# nucontrol parameters
+# ---------------------------------------------------------------------------------------------
+# Central place for every tunable knob. Pass this file to the CLI with:
+#
+#     nucontrol-generate-routes --config params.yaml
+#
+# Precedence: an explicit command-line flag  >  this file  >  the built-in default.
+# So you can keep your standing setup here and still override one value on the command line, e.g.
+#
+#     nucontrol-generate-routes --config params.yaml --max-alternatives 5
+#
+# Any value left as `null` (or omitted) falls back to the built-in default / environment variable.
+
+# --- Dataset / loader -------------------------------------------------------------------------
+dataset:
+  # nuPlan data root. null -> use the NUPLAN_DATA_ROOT environment variable. May be the dataset
+  # mount root (logs found under nuplan-v1.1/splits/<split>) or a directory of .db files directly.
+  data_root: null
+  # nuPlan maps root. null -> use the NUPLAN_MAPS_ROOT environment variable.
+  map_root: null
+  # Map database version.
+  map_version: nuplan-maps-v1.0
+  # Which split subdirectory(ies) to search when data_root is a mount root. null -> the
+  # NUCONTROL_SPLITS env var if set, else "trainval" (the official split holding val14). The
+  # official dataset ships only trainval and test; use ["test"] for test14, ["mini"] for mini.
+  splits: null            # e.g. [trainval]  or  [test]
+  # Threads for the one-time token-location scan (I/O-bound on opening the split's log DBs).
+  scan_threads: 64
+
+# --- Alternative-route search -----------------------------------------------------------------
+search:
+  # Target/cap for the number of alternatives per scenario. ALL options at the first junction are
+  # always kept even if they exceed this; it only bounds the second-junction top-up. So you get
+  # more than this only when the first junction alone provides them.
+  max_alternatives: 3
+  # Soft upper bound (from 0 m) on how far ahead of the ego the FIRST divergence junction may be.
+  divergence_max_distance_m: 50.0
+  # Soft target travel time to the goal: branches are extended until the ego would need ~this many
+  # seconds of driving, and the goal pose is placed at that point.
+  goal_time_s: 60.0
+  # Lower bound on a branch's achievable travel time; 0 keeps every branch (dead-ends included),
+  # raise it to drop trivially short spurs.
+  min_goal_time_s: 0.0
+  # Fallback speed (m/s) used to time a lane when its speed limit is missing.
+  default_speed_mps: 10.0
+  # Floor on the per-lane speed (m/s) used for timing, so very low speed limits don't blow up times.
+  min_speed_mps: 2.0
+
+# --- Input / output ---------------------------------------------------------------------------
+io:
+  # Scenario tokens to process. Provide either an inline list here...
+  tokens: null            # e.g. ["8eb8410b1e385101", "4196301b207f5f09"]
+  # ...or a path to a text file with one token per line (# comments allowed). Ignored if `tokens`
+  # is set. Command-line --tokens / --tokens-file override both.
+  tokens_file: null
+  # Output JSONL file NAME for the generated alternative routes. Only the file name is used — the
+  # file is always written to the package root (any directory component here or in --output is
+  # ignored), so runs land in the same place regardless of the current working directory.
+  output: alternative_routes.jsonl
+  # Append to the output file instead of overwriting it.
+  append: false
+  # Print a per-token summary (divergence distance, #alternatives, goals).
+  verbose: false

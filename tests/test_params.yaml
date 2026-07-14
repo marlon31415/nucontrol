@@ -1,0 +1,20 @@
+# Test-suite parameters — independent from the top-level params.yaml.
+# The tests load THIS file by default; editing it changes how the tests search/visualize but does
+# NOT affect the CLI default (which uses the repo-root params.yaml). Override with --config or the
+# NUCONTROL_CONFIG environment variable. See ../params.yaml for the full annotated list of knobs.
+
+# --- Dataset / loader ---
+dataset:
+  # The demo token lives in trainval; pin it so the tests are deterministic regardless of any
+  # NUCONTROL_SPLITS environment variable. (Ignored when NUPLAN_DATA_ROOT is a single split dir.)
+  splits: [trainval]
+  scan_threads: 64
+
+# --- Alternative-route search ---
+search:
+  max_alternatives: 3
+  divergence_max_distance_m: 50.0
+  goal_time_s: 60.0
+  min_goal_time_s: 0.0
+  default_speed_mps: 10.0
+  min_speed_mps: 2.0
