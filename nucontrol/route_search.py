@@ -163,6 +163,7 @@ def search_alternative_routes(
     scenario: NuPlanScenario,
     max_alternatives: int = 3,
     *,
+    min_lane_change_distance_m: float = 5.0,
     divergence_max_distance_m: float = 50.0,
     goal_time_s: float = 60.0,
     min_goal_time_s: float = 0.0,
@@ -182,6 +183,14 @@ def search_alternative_routes(
         scenario: The loaded nuPlan scenario (ego states, map API, mission goal, route).
         max_alternatives: Target/cap for the total number of alternatives. First-junction options
             are always all kept even if they exceed this; it only bounds the level-2 top-up.
+        min_lane_change_distance_m: Runway (m) required **per lane change**, applied per branch.
+            Reaching a branch may need N lane changes (N=0 when the ego's current lane already feeds
+            into it, e.g. go straight vs. turn right from a shared lane); the branch is kept only if
+            ``N * min_lane_change_distance_m`` <= the distance to the junction. So same-lane branches
+            (N=0) are always allowed, a single lane change needs this much room, and a branch that
+            would take several lane changes is dropped unless the junction is far enough ahead to
+            fit them. If every branch at a junction is dropped, the search moves to the next
+            junction. 0 disables the floor (every branch at the nearest in-range junction is kept).
         divergence_max_distance_m: Soft upper bound (from 0m) on how far ahead of the ego the
             first divergence junction may be for alternatives to be searched.
         goal_time_s: Soft target driving time from the ego to the alternative goal (~1 min). If a
@@ -262,15 +271,29 @@ def search_alternative_routes(
         alt_branches = [e for e in rb.outgoing_edges if e.id != next_id]
 
         if alt_branches and cum_dist_end <= divergence_max_distance_m:
-            first_div = _Divergence(
-                prefix_ids=route[: i + 1],
-                prefix_time_s=cum_time_end,
-                junction_lane=lane,
-                on_route_next_id=next_id,
-                branches=alt_branches,
-                distance_m=cum_dist_end,
-            )
-            break
+            # Lane-change runway, applied per branch. Reaching a branch may require N lane changes
+            # (N=0 when the ego's current lane already feeds into it, e.g. straight vs. turn right
+            # from a shared lane). Each lane change needs ~min_lane_change_distance_m of runway, so a
+            # branch is admissible only if N * min_lane_change_distance_m <= distance to the
+            # junction. This drops turns/lane changes the ego is too close to still execute (a
+            # single one near the junction, or several that would need more room than is left),
+            # while always keeping same-lane branches (N=0) regardless of distance.
+            branches = [
+                b
+                for b in alt_branches
+                if (n := _lane_changes_to_branch(lane, rb, b)) is not None
+                and n * min_lane_change_distance_m <= cum_dist_end
+            ]
+            if branches:
+                first_div = _Divergence(
+                    prefix_ids=route[: i + 1],
+                    prefix_time_s=cum_time_end,
+                    junction_lane=lane,
+                    on_route_next_id=next_id,
+                    branches=branches,
+                    distance_m=cum_dist_end,
+                )
+                break
 
         cum_dist, cum_time = cum_dist_end, cum_time_end
         prev_lane = lane

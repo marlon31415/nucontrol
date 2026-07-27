@@ -34,6 +34,7 @@ DEFAULTS: Dict[str, Dict[str, Any]] = {
     },
     "search": {
         "max_alternatives": 3,
+        "min_lane_change_distance_m": 5.0,
         "divergence_max_distance_m": 50.0,
         "goal_time_s": 60.0,
         "min_goal_time_s": 0.0,

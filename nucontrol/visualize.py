@@ -209,9 +209,10 @@ def visualize_token(
 ) -> List[str]:
     """Write one PNG for the original route and one per alternative route of ``scenario``.
 
-    Extra keyword arguments (``divergence_max_distance_m``, ``goal_time_s``, ``min_goal_time_s``,
-    ``default_speed_mps``, ``min_speed_mps``) are forwarded to the route search, so a parameter file
-    drives the figures exactly as it drives the generated dataset. Returns the written file paths.
+    Extra keyword arguments (``min_lane_change_distance_m``, ``divergence_max_distance_m``,
+    ``goal_time_s``, ``min_goal_time_s``, ``default_speed_mps``, ``min_speed_mps``) are forwarded to
+    the route search, so a parameter file drives the figures exactly as it drives the generated
+    dataset. Returns the written file paths.
     """
     os.makedirs(out_dir, exist_ok=True)
     token = scenario.token

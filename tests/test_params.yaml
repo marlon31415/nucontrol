@@ -13,7 +13,8 @@ dataset:
 # --- Alternative-route search ---
 search:
   max_alternatives: 3
-  divergence_max_distance_m: 50.0
+  min_lane_change_distance_m: 10.0
+  divergence_max_distance_m: 100.0
   goal_time_s: 60.0
   min_goal_time_s: 0.0
   default_speed_mps: 10.0

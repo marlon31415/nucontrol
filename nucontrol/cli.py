@@ -91,6 +91,13 @@ def build_parser() -> argparse.ArgumentParser:
         "kept (even if more than this); this only caps the second-junction top-up."
     ))
     parser.add_argument(
+        "--min-lane-change-distance-m", type=float, default=None,
+        help="Runway (m) required per lane change to reach a divergence branch. A branch needing N "
+             "lane changes is kept only if N*this <= distance to the junction, so same-lane "
+             "branches (N=0) are always allowed and multi-lane-change turns are dropped when the "
+             "junction is too close. 0 disables.",
+    )
+    parser.add_argument(
         "--divergence-max-distance-m", type=float, default=None,
         help="Max distance ahead of the ego (m) for the first divergence junction.",
     )
@@ -172,6 +179,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     kwargs = search_kwargs(
         config,
         max_alternatives=args.max_alternatives,
+        min_lane_change_distance_m=args.min_lane_change_distance_m,
         divergence_max_distance_m=args.divergence_max_distance_m,
         goal_time_s=args.goal_time_s,
         min_goal_time_s=args.min_goal_time_s,

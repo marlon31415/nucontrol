@@ -33,6 +33,15 @@ search:
   # always kept even if they exceed this; it only bounds the second-junction top-up. So you get
   # more than this only when the first junction alone provides them.
   max_alternatives: 3
+  # Runway (m) required PER LANE CHANGE to reach a divergence branch, applied per branch. Reaching
+  # a branch may need N lane changes (N=0 when the ego's current lane already feeds into it, e.g.
+  # straight vs. right turn from a shared lane); the branch is kept only if
+  # N * min_lane_change_distance_m <= the distance to the junction. So same-lane branches are always
+  # allowed, one lane change needs this much room, and a branch that would take several lane changes
+  # is dropped unless the junction is far enough ahead to fit them (e.g. 4 changes at 30m ahead with
+  # 10m each needs 40m -> dropped). If every branch at a junction is dropped, the search takes the
+  # next junction. Set 0 to disable.
+  min_lane_change_distance_m: 10.0
   # Soft upper bound (from 0 m) on how far ahead of the ego the FIRST divergence junction may be.
   divergence_max_distance_m: 100.0
   # Soft target travel time to the goal: branches are extended until the ego would need ~this many
