@@ -9,6 +9,7 @@ dataset:
   # NUCONTROL_SPLITS environment variable. (Ignored when NUPLAN_DATA_ROOT is a single split dir.)
   splits: [trainval]
   scan_threads: 64
+  extraction_offset: -3.0
 
 # --- Alternative-route search ---
 search:

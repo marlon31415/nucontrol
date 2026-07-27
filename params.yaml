@@ -26,6 +26,12 @@ dataset:
   splits: null            # e.g. [trainval]  or  [test]
   # Threads for the one-time token-location scan (I/O-bound on opening the split's log DBs).
   scan_threads: 64
+  # Scenario extraction offset [s] applied when loading a token. The loaded initial ego pose sits at
+  # anchor + extraction_offset, and the alt route is searched from that pose. Set to -3.0 to match the
+  # nuPlan simulation builders (nuplan_eval / nuplan_challenge), whose val14
+  # scenarios also load at -3.0 — so the alt route is searched from the exact pose the planner starts
+  # at (3s before the tagged token, giving run-up).
+  extraction_offset: -3.0
 
 # --- Alternative-route search -----------------------------------------------------------------
 search:

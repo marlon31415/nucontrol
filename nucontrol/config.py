@@ -31,6 +31,7 @@ DEFAULTS: Dict[str, Dict[str, Any]] = {
         "splits": None,
         "log_split": "val",
         "max_workers": None,
+        "extraction_offset": -3.0,
     },
     "search": {
         "max_alternatives": 3,
@@ -121,6 +122,9 @@ def make_loader(
         include_splits=resolve(overrides.get("splits"), ds, "splits", None),
         log_split=resolve(overrides.get("log_split"), ds, "log_split", "val"),
         max_workers=resolve(overrides.get("max_workers"), ds, "max_workers", None),
+        extraction_offset=resolve(
+            overrides.get("extraction_offset"), ds, "extraction_offset", -3.0
+        ),
     )
 
 

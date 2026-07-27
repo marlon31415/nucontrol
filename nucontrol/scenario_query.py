@@ -25,6 +25,10 @@ from nuplan.planning.scenario_builder.nuplan_db.nuplan_scenario import NuPlanSce
 from nuplan.planning.scenario_builder.nuplan_db.nuplan_scenario_builder import (
     NuPlanScenarioBuilder,
 )
+from nuplan.planning.scenario_builder.nuplan_db.nuplan_scenario_utils import (
+    ScenarioExtractionInfo,
+    ScenarioMapping,
+)
 from nuplan.planning.scenario_builder.scenario_filter import ScenarioFilter
 from nuplan.planning.utils.multithreading.worker_parallel import (
     SingleMachineParallelExecutor,
@@ -38,6 +42,34 @@ _MAX_TOKENS_PER_QUERY = 100000
 
 # Default worker count for the parallel scenario build (opens/queries the log DBs).
 _DEFAULT_MAX_WORKERS = 64
+
+# Default extraction offset [s] applied when loading a token, so the loaded initial ego pose
+_DEFAULT_EXTRACTION_OFFSET = -3.0
+
+
+class _OffsetScenarioMapping(ScenarioMapping):
+    """A ScenarioMapping that applies one fixed extraction window to *every* scenario type.
+
+    nuPlan keys extraction info (duration / offset / subsample) by scenario *type*, but we load by
+    token and want the same iteration-0 pose the simulation uses regardless of the token's tagged
+    type. This returns a single extraction window for any type. ``initial_lidar_token`` stays the
+    anchor token (so ``token`` / ``get_route_roadblock_ids`` / ``get_mission_goal`` are unchanged),
+    while ``initial_ego_state`` shifts to ``anchor + extraction_offset`` — exactly mirroring the
+    simulation's builder.
+    """
+
+    def __init__(self, extraction_offset: float) -> None:
+        super().__init__({}, None)
+        self._info = ScenarioExtractionInfo(
+            scenario_name="nucontrol_offset",
+            scenario_duration=abs(extraction_offset) + 1.0,
+            extraction_offset=extraction_offset,
+            subsample_ratio=1.0,
+        )
+
+    def get_extraction_info(self, scenario_type: str) -> ScenarioExtractionInfo:
+        return self._info
+
 
 # Default split(s) to search for ``.db`` files when ``NUPLAN_DATA_ROOT`` is a dataset mount root
 # rather than a split dir. The official nuPlan dataset ships only ``trainval`` and ``test``; the
@@ -124,6 +156,13 @@ class ScenarioLoader:
             loading fast: only the split's logs are opened. For val14/test14 keep the matching
             split; use ``"all"`` only when tokens span splits (slow — opens every log).
         max_workers: Worker count for the parallel scenario build (default 64).
+        extraction_offset: Scenario extraction offset [s] applied when building each token, so the
+            loaded ``initial_ego_state`` matches the pose the closed-loop simulation actually starts
+            the ego at (its iteration 0). Defaults to :data:`_DEFAULT_EXTRACTION_OFFSET` (-3.0, the
+            same offset the nuPlan sim builders apply to val14). A negative value moves the start behind the
+            tagged token (giving run-up to the event, as the sim does), a positive value ahead; set
+            to ``0`` to anchor on the exact token frame (single-frame load, = the route-dataset
+            ``start_abs``).
     """
 
     def __init__(
@@ -134,6 +173,7 @@ class ScenarioLoader:
         include_splits: Optional[List[str]] = None,
         log_split: Optional[str] = "val",
         max_workers: Optional[int] = None,
+        extraction_offset: Optional[float] = None,
     ) -> None:
         self.data_root = data_root or os.environ.get("NUPLAN_DATA_ROOT")
         self.map_root = map_root or os.environ.get("NUPLAN_MAPS_ROOT")
@@ -149,6 +189,11 @@ class ScenarioLoader:
             )
         self.map_version = map_version
         self.max_workers = max_workers or _DEFAULT_MAX_WORKERS
+
+        # Extraction offset: explicit arg > default (-3.0).
+        if extraction_offset is None:
+            extraction_offset = _DEFAULT_EXTRACTION_OFFSET
+        self.extraction_offset = extraction_offset
 
         # Allow selecting split(s) via env (e.g. NUCONTROL_SPLITS="test") when NUPLAN_DATA_ROOT is a
         # mount root; the explicit argument takes precedence.
@@ -186,6 +231,14 @@ class ScenarioLoader:
 
         log_names = _load_log_names(self.log_split)
 
+        # Apply the same extraction offset the simulation uses so the loaded iteration-0 ego pose
+        # matches. offset == 0 -> no mapping (single-frame load anchored on the exact token).
+        scenario_mapping = (
+            _OffsetScenarioMapping(self.extraction_offset)
+            if self.extraction_offset != 0.0
+            else None
+        )
+
         # Discover DB filenames under the search dirs (a cheap glob — the files are not opened here).
         # nuPlan opens a DB only when its log name is in ``log_names``, so restricting to the split's
         # logs is what keeps this fast.
@@ -197,6 +250,7 @@ class ScenarioLoader:
             self.map_version,
             max_workers=self.max_workers,
             verbose=False,
+            scenario_mapping=scenario_mapping,
         )
         worker = SingleMachineParallelExecutor(
             use_process_pool=False, max_workers=self.max_workers
