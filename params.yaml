@@ -34,7 +34,7 @@ search:
   # more than this only when the first junction alone provides them.
   max_alternatives: 3
   # Soft upper bound (from 0 m) on how far ahead of the ego the FIRST divergence junction may be.
-  divergence_max_distance_m: 50.0
+  divergence_max_distance_m: 100.0
   # Soft target travel time to the goal: branches are extended until the ego would need ~this many
   # seconds of driving, and the goal pose is placed at that point.
   goal_time_s: 60.0
