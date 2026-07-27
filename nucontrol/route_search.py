@@ -72,10 +72,17 @@ def extract_original_route(
     stored = [rid for rid in scenario.get_route_roadblock_ids() if rid]
     stored_set = set(stored)
 
-    # Start roadblock: where the ego is right now (single-point query survives a standstill).
-    start_ids = get_roadblock_ids_from_trajectory(map_api, [ego_state])
-    start_id = start_ids[0] if start_ids else (stored[0] if stored else None)
-    rb = _get_roadblock(map_api, start_id) if start_id else None
+    # Start roadblock: the block the ego actually sits on RIGHT NOW. This must be resolved by
+    # proximity+heading (see _ego_current_roadblock), not by the stored route's first id: the
+    # stored mission route begins where the route was originally laid out, which can be several
+    # roadblocks BEHIND the ego, so anchoring there would search alternatives from a lane the ego
+    # has already passed. The single-point trajectory query is only a fallback because it returns
+    # nothing when the ego is stopped on a connector (a standstill at a junction).
+    rb = _ego_current_roadblock(map_api, ego_state, stored_set)
+    if rb is None:
+        start_ids = get_roadblock_ids_from_trajectory(map_api, [ego_state])
+        start_id = start_ids[0] if start_ids else (stored[0] if stored else None)
+        rb = _get_roadblock(map_api, start_id) if start_id else None
     if rb is None:
         return list(stored)
 
@@ -393,6 +400,114 @@ def _get_roadblock(
     """Resolve a roadblock or roadblock-connector by id."""
     rb = map_api.get_map_object(rb_id, SemanticMapLayer.ROADBLOCK)
     return rb or map_api.get_map_object(rb_id, SemanticMapLayer.ROADBLOCK_CONNECTOR)
+
+
+def _ego_current_roadblock(
+    map_api: AbstractMap,
+    ego_state,
+    stored_set: set,
+    *,
+    radius_m: float = 2.0,
+    heading_thresh: float = math.pi / 4,
+    displacement_thresh: float = 3.0,
+) -> Optional[RoadBlockGraphEdgeMapObject]:
+    """Resolve the roadblock/connector the ego currently occupies, robust to standstills.
+
+    Mirrors nuplan/flow_drive's ``get_current_roadblock_candidates``: among the roadblocks and
+    connectors near the ego, keep those whose closest interior-lane point is both near the ego
+    (< ``displacement_thresh`` m) and heading-aligned with it (< ``heading_thresh`` rad), then take
+    the nearest — **preferring one on the stored mission route**. The heading test rejects an
+    overlapping opposite-direction block, and preferring an on-route block plus the distance test
+    pins the anchor to the ego's *current* block rather than one it has already driven through.
+    Returns ``None`` only if nothing plausible is nearby (callers then fall back).
+    """
+    ego_pose: StateSE2 = ego_state.rear_axle
+    ego_point = ego_pose.point
+    layers = [SemanticMapLayer.ROADBLOCK, SemanticMapLayer.ROADBLOCK_CONNECTOR]
+
+    proximal = map_api.get_proximal_map_objects(
+        point=ego_point, radius=radius_m, layers=layers
+    )
+    candidates = (
+        proximal[SemanticMapLayer.ROADBLOCK]
+        + proximal[SemanticMapLayer.ROADBLOCK_CONNECTOR]
+    )
+    if not candidates:
+        for layer in layers:
+            rid, _ = map_api.get_distance_to_nearest_map_object(
+                point=ego_point, layer=layer
+            )
+            rb = map_api.get_map_object(rid, layer) if rid else None
+            if rb is not None:
+                candidates.append(rb)
+
+    best_on_route: Optional[RoadBlockGraphEdgeMapObject] = None
+    best_on_route_disp = math.inf
+    best_any: Optional[RoadBlockGraphEdgeMapObject] = None
+    best_any_disp = math.inf
+    for rb in candidates:
+        disp, head = math.inf, math.inf
+        for lane in rb.interior_edges:
+            path = lane.baseline_path.discrete_path
+            j = min(
+                range(len(path)),
+                key=lambda k: (path[k].x - ego_point.x) ** 2
+                + (path[k].y - ego_point.y) ** 2,
+            )
+            d = math.hypot(path[j].x - ego_point.x, path[j].y - ego_point.y)
+            if d < disp:
+                disp = d
+                head = abs(_normalize_angle(path[j].heading - ego_pose.heading))
+        if disp >= displacement_thresh or head >= heading_thresh:
+            continue
+        if rb.id in stored_set:
+            if disp < best_on_route_disp:
+                best_on_route, best_on_route_disp = rb, disp
+        elif disp < best_any_disp:
+            best_any, best_any_disp = rb, disp
+
+    return best_on_route if best_on_route is not None else best_any
+
+
+def _lane_index(lane: LaneGraphEdgeMapObject) -> Optional[int]:
+    """The lane's 1-indexed lateral slot within its roadblock, or None if it has none.
+
+    Only proper lanes carry a lateral index; lane-connectors (interior edges of a roadblock
+    connector) do not, so this returns None for them.
+    """
+    idx = getattr(lane, "index", None)
+    return int(idx) if isinstance(idx, int) else None
+
+
+def _lane_changes_to_branch(
+    lane: LaneGraphEdgeMapObject,
+    rb: RoadBlockGraphEdgeMapObject,
+    branch: RoadBlockGraphEdgeMapObject,
+) -> Optional[int]:
+    """Number of lane changes for the ego (on ``lane``) to reach ``branch`` from roadblock ``rb``.
+
+    An *entry lane* is an interior lane of ``rb`` that feeds directly into ``branch`` (one of its
+    successor edges is an interior lane of the branch). The ego must be in an entry lane before the
+    junction, so the count is the lateral lane-index distance from ``lane`` to the nearest entry
+    lane — 0 if ``lane`` is itself an entry lane. Returns None if ``branch`` is not reachable from
+    ``rb`` at all, or the lateral distance can't be determined (e.g. ``rb`` is a roadblock-connector
+    whose interior connectors carry no lane index — inside a junction no lane change is possible).
+    """
+    branch_lane_ids = {e.id for e in branch.interior_edges}
+    entry_lanes = [
+        ln
+        for ln in rb.interior_edges
+        if any(e.id in branch_lane_ids for e in ln.outgoing_edges)
+    ]
+    if not entry_lanes:
+        return None
+    if any(ln.id == lane.id for ln in entry_lanes):
+        return 0
+    ego_idx = _lane_index(lane)
+    entry_idxs = [j for j in (_lane_index(ln) for ln in entry_lanes) if j is not None]
+    if ego_idx is None or not entry_idxs:
+        return None
+    return min(abs(ego_idx - j) for j in entry_idxs)
 
 
 def _lane_speed(
