@@ -54,6 +54,7 @@ class ModifiedRoutingScenario:
         route_roadblock_ids: Optional[Sequence[str]] = None,
         mission_goal: Optional[Pose] = None,
         scenario_name: Optional[str] = None,
+        alt_goal_distance_m: Optional[float] = None,
     ) -> None:
         self._scenario = scenario
         self._route_roadblock_ids: Optional[List[str]] = (
@@ -65,6 +66,10 @@ class ModifiedRoutingScenario:
         # Optional unique name so several alternatives of the same token do not collide on the
         # simulation output directory (which is keyed by scenario_name == token by default).
         self._scenario_name: Optional[str] = scenario_name
+        # Total planned distance of this alternative route to its goal (meta.goal_distance_m). Read
+        # by the ego_progress_along_expert_route metric to build a synthetic progress reference, since
+        # alternative routes have no expert (logged-human) trajectory to compare against.
+        self._alt_goal_distance_m: Optional[float] = alt_goal_distance_m
 
     # --- overridden identity ----------------------------------------------------------------
     @property
@@ -72,6 +77,17 @@ class ModifiedRoutingScenario:
         if self._scenario_name is not None:
             return self._scenario_name
         return self._scenario.scenario_name
+
+    # --- alternative-route metadata ---------------------------------------------------------
+    @property
+    def alt_goal_distance_m(self) -> Optional[float]:
+        """Planned distance [m] of this alternative route to its goal (``None`` if not provided).
+
+        Defined as a real class property so normal attribute lookup finds it *before* ``__getattr__``
+        delegates to the wrapped scenario; a plain nuPlan scenario has no such attribute, so metrics
+        use ``getattr(scenario, "alt_goal_distance_m", None)`` and get ``None`` there.
+        """
+        return self._alt_goal_distance_m
 
     # --- overridden routing accessors -------------------------------------------------------
     def get_route_roadblock_ids(self) -> List[str]:
@@ -113,6 +129,7 @@ def change_routing(
     route_ids: Optional[Sequence[str]] = None,
     goal_position: Optional[Pose] = None,
     scenario_name: Optional[str] = None,
+    alt_goal_distance_m: Optional[float] = None,
 ) -> ModifiedRoutingScenario:
     """Return a rerouted view of ``scenario`` with a new route and/or mission goal.
 
@@ -124,6 +141,8 @@ def change_routing(
         scenario_name: Optional unique name for the rerouted view. Use this when several
             alternatives share the same token, so their simulation outputs (keyed by
             ``scenario_name``) do not overwrite each other. If ``None``, the original name is kept.
+        alt_goal_distance_m: Planned distance [m] of this alternative route to its goal, exposed to
+            the ego-progress metric as a reference. If ``None``, the metric keeps its expert path.
 
     Returns:
         A :class:`ModifiedRoutingScenario` drop-in that reports the new route/goal but otherwise
@@ -134,4 +153,5 @@ def change_routing(
         route_roadblock_ids=route_ids,
         mission_goal=goal_position,
         scenario_name=scenario_name,
+        alt_goal_distance_m=alt_goal_distance_m,
     )

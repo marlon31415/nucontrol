@@ -59,6 +59,7 @@ def expand_scenarios_with_alternatives(
                     route_ids=alt.route_ids,
                     goal_position=alt.goal_position,
                     scenario_name=f"{scenario.token}_alt{i}",
+                    alt_goal_distance_m=alt.meta.get("goal_distance_m"),
                 )
             )
     return expanded
