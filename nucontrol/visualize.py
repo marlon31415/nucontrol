@@ -63,6 +63,8 @@ def plot_route(
     title: str,
     out_path: str,
     pad_m: float = 25.0,
+    vias: Optional[Sequence[Tuple[float, float]]] = None,
+    maneuver_positions: Optional[Sequence[Tuple[float, float]]] = None,
 ) -> str:
     """Render the map and highlight ``roadblock_ids``' lanes in blue, auto-framed to the route.
 
@@ -94,6 +96,18 @@ def plot_route(
             lane_xy.append(xy)
             xs.extend(xy[0])
             ys.extend(xy[1])
+
+    valid_maneuvers: List[Tuple[float, float]] = []
+    if maneuver_positions:
+        for pos in maneuver_positions:
+            x_m, y_m = float(pos[0]), float(pos[1])
+            # [0, 0] is a known invalid placeholder in routing datasets.
+            if abs(x_m) < 1e-9 and abs(y_m) < 1e-9:
+                continue
+            valid_maneuvers.append((x_m, y_m))
+            xs.append(x_m)
+            ys.append(y_m)
+
     if goal is not None:
         xs.append(goal[0])
         ys.append(goal[1])
@@ -185,6 +199,53 @@ def plot_route(
             markeredgecolor="black",
             zorder=6,
             label="goal",
+        )
+
+    # Optional routing via-points used to pin route requests.
+    if vias:
+        xs_via = [v[0] for v in vias]
+        ys_via = [v[1] for v in vias]
+        ax.plot(
+            xs_via,
+            ys_via,
+            "o",
+            color="orange",
+            markersize=8,
+            markeredgecolor="black",
+            zorder=7,
+            label="via",
+        )
+        for idx, (x_via, y_via) in enumerate(vias, start=1):
+            ax.text(
+                x_via,
+                y_via,
+                str(idx),
+                fontsize=8,
+                color="black",
+                ha="center",
+                va="center",
+                zorder=8,
+                bbox={
+                    "boxstyle": "round,pad=0.15",
+                    "fc": "white",
+                    "ec": "none",
+                    "alpha": 0.8,
+                },
+            )
+
+    # Optional route maneuver points from dataset routing output.
+    if valid_maneuvers:
+        ax.plot(
+            [p[0] for p in valid_maneuvers],
+            [p[1] for p in valid_maneuvers],
+            marker="x",
+            color="magenta",
+            linestyle="--",
+            linewidth=1.2,
+            markersize=8,
+            markeredgewidth=1.8,
+            zorder=7,
+            label="maneuver",
         )
 
     ax.set_aspect("equal")
