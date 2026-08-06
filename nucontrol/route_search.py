@@ -21,7 +21,7 @@ the distance budget), an empty list is returned and the scenario should be skipp
 from __future__ import annotations
 
 import math
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from nuplan.common.actor_state.state_representation import Point2D, StateSE2
 from nuplan.common.maps.abstract_map import AbstractMap
@@ -48,8 +48,9 @@ def extract_original_route(
     goal_time_s: float = 60.0,
     default_speed_mps: float = 10.0,
     min_speed_mps: float = 2.0,
-    max_roadblocks: int = 300,
+    max_roadblocks: int = 30,
     goal: Optional[Point2D] = None,
+    goal_heading: Optional[float] = None,
     goal_radius_m: float = 5.0,
 ) -> List[str]:
     """Return the ego's original route as a clean, connected list of roadblock ids.
@@ -69,15 +70,27 @@ def extract_original_route(
 
     If ``goal`` is given, the walk targets actually **reaching** the goal's roadblock (resolved by
     proximity, within ``goal_radius_m``) instead of stopping purely on the ``goal_time_s`` time
-    budget, which can otherwise cut the route off before a goal that's genuinely on it:
+    budget, which can otherwise cut the route off before a goal that's genuinely on it — and,
+    unlike the plain time-budgeted walk, is guided by real graph distance rather than the stored
+    route or heading alone:
 
-    - If the goal's roadblock is already in the scenario's stored route, the existing on-route
-      preference at each fork already threads the walk through it — only the ``goal_time_s`` cutoff
-      is lifted, so the walk keeps going (up to ``max_roadblocks``) until it actually gets there.
-    - If the goal's roadblock is *not* in the stored route (the stored route runs out before
-      reaching it), a bounded backward search from the goal (via ``incoming_edges``) finds which
-      roadblocks can actually reach it; once the stored-route preference runs out, the forward walk
-      prefers a branch confirmed by that backward search over guessing by heading alone.
+    - ``goal_heading`` (recommended whenever available) rejects candidate roadblocks near ``goal``
+      whose travel direction differs by more than 90 degrees. Without it, a location with two
+      roadblocks representing opposite directions close together (e.g. both carriageways of a
+      divided road) can resolve to the wrong (oncoming) one from a sub-meter difference in the
+      query point — which then sends the whole walk chasing an unreachable or irrelevant target.
+
+    - A bounded backward search from the goal (via ``incoming_edges``) computes each reachable
+      roadblock's hop-distance to it. This runs **whenever a goal is given**, regardless of whether
+      the goal's roadblock happens to be in the scenario's stored route: the stored route covers
+      the whole scenario log and can legitimately be far longer than necessary to reach this
+      particular goal (e.g. it continues on a big loop well beyond the near-term horizon), so
+      on-route membership alone is not a reliable proxy for "the efficient way to get there".
+    - At each fork, the forward walk picks whichever candidate has the *smallest* verified
+      hop-distance to the goal, if any candidate has one — always making real, confirmed progress
+      instead of blindly following the stored route's full length or guessing by heading. Only
+      when no candidate is covered by the backward search (budget exhausted, or a genuine dead
+      branch) does it fall back to the stored-route/heading preference used when no goal is given.
     - If ``goal`` can't be resolved to any roadblock within ``goal_radius_m`` (e.g. off-map), or no
       connecting path is found within ``max_roadblocks``, this falls back to the plain
       ``goal_time_s``-bounded walk (dead end via ``outgoing_edges`` breaks the loop as before).
@@ -104,13 +117,16 @@ def extract_original_route(
         return list(stored)
 
     goal_roadblock_id = (
-        _roadblock_id_near_point(map_api, goal, goal_radius_m) if goal is not None else None
+        _roadblock_id_near_point(map_api, goal, goal_radius_m, heading=goal_heading)
+        if goal is not None
+        else None
     )
-    # Only need the backward search when the goal lies beyond the stored/annotated route: if it's
-    # already in stored_set, the existing on-route preference below finds it without any help.
-    reachable_to_goal: Optional[set] = None
-    if goal_roadblock_id is not None and goal_roadblock_id not in stored_set:
-        reachable_to_goal = _backward_reachable_set(
+    # Computed whenever a goal is given (not only when it's off the stored route — see docstring):
+    # the stored route can be much longer than necessary to reach this specific goal, so on-route
+    # membership alone can't be trusted to guide the walk efficiently toward it.
+    goal_distances: Optional[Dict[str, int]] = None
+    if goal_roadblock_id is not None:
+        goal_distances = _backward_distances_to_goal(
             map_api, goal_roadblock_id, max_roadblocks=max_roadblocks
         )
 
@@ -124,7 +140,9 @@ def extract_original_route(
     # Time already used up on the ego's current block (from the ego's arc position to its end).
     cum_time = 0.0
     if prev_lane is not None:
-        covered = prev_lane.baseline_path.get_nearest_arc_length_from_position(ego_point)
+        covered = prev_lane.baseline_path.get_nearest_arc_length_from_position(
+            ego_point
+        )
         remaining = max(prev_lane.baseline_path.length - covered, 0.0)
         cum_time += remaining / _lane_speed(prev_lane, default_speed_mps, min_speed_mps)
 
@@ -137,29 +155,39 @@ def extract_original_route(
         candidates = [e for e in rb.outgoing_edges if e.id not in visited]
         if not candidates:
             break
-        on_route = [e for e in candidates if e.id in stored_set]
+
         goal_directed = (
-            [e for e in candidates if e.id in reachable_to_goal]
-            if reachable_to_goal is not None
+            [e for e in candidates if e.id in goal_distances]
+            if goal_distances is not None
             else []
         )
-        # Prefer the stored mission route; once that's exhausted, prefer a branch confirmed (by
-        # backward search) to actually reach the goal; only fall back to a heading guess if
-        # neither applies.
-        pool = on_route or goal_directed or candidates
-        ref_heading = (
-            prev_lane.baseline_path.discrete_path[-1].heading if prev_lane is not None else None
-        )
-        if ref_heading is None:
-            nxt = pool[0]
+        if goal_directed:
+            # Verified progress toward the goal beats both the stored route (which can be far
+            # longer than needed for this goal) and a heading guess: always take the candidate
+            # with the smallest confirmed remaining hop-distance.
+            nxt = min(goal_directed, key=lambda e: goal_distances[e.id])
         else:
-            nxt = min(pool, key=lambda e: _branch_misalignment(e, prev_lane, ref_heading))
+            on_route = [e for e in candidates if e.id in stored_set]
+            pool = on_route or candidates
+            ref_heading = (
+                prev_lane.baseline_path.discrete_path[-1].heading
+                if prev_lane is not None
+                else None
+            )
+            if ref_heading is None:
+                nxt = pool[0]
+            else:
+                nxt = min(
+                    pool, key=lambda e: _branch_misalignment(e, prev_lane, ref_heading)
+                )
         lane = _straightest_lane(nxt, prev_lane)
         if lane is None:
             break
         route_ids.append(nxt.id)
         visited.add(nxt.id)
-        cum_time += lane.baseline_path.length / _lane_speed(lane, default_speed_mps, min_speed_mps)
+        cum_time += lane.baseline_path.length / _lane_speed(
+            lane, default_speed_mps, min_speed_mps
+        )
         rb, prev_lane = nxt, lane
 
         if nxt.id == goal_roadblock_id:
@@ -191,7 +219,9 @@ def route_end_pose(
     return (p.x, p.y, p.heading)
 
 
-def route_lanes(map_api: AbstractMap, roadblock_ids: List[str]) -> List[LaneGraphEdgeMapObject]:
+def route_lanes(
+    map_api: AbstractMap, roadblock_ids: List[str]
+) -> List[LaneGraphEdgeMapObject]:
     """Expand a list of route roadblock ids into their interior **route lanes**.
 
     A route is expressed at the roadblock level; a lane is "on route" iff its parent roadblock is
@@ -473,15 +503,32 @@ def _get_roadblock(
 
 
 def _roadblock_id_near_point(
-    map_api: AbstractMap, point: Point2D, radius_m: float
+    map_api: AbstractMap,
+    point: Point2D,
+    radius_m: float,
+    heading: Optional[float] = None,
+    heading_thresh: float = math.pi / 2,
 ) -> Optional[str]:
     """Id of the roadblock/connector whose nearest interior-lane point is closest to ``point``.
 
-    Returns ``None`` if nothing is within ``radius_m`` (e.g. an off-map or badly mismapped goal).
+    If ``heading`` is given, a candidate is only considered when its nearest-point lane heading is
+    within ``heading_thresh`` (default 90 degrees) of it. Without this, plain proximity can't tell
+    apart two roadblocks representing opposite travel directions at nearly the same location (e.g.
+    the two carriageways of a divided road) — a sub-meter perturbation in ``point`` (such as the
+    small shift between a raw trajectory point and its lane-projected counterpart) can then flip
+    which one gets picked, silently resolving to the oncoming roadblock instead of the correct one.
+
+    Returns ``None`` if nothing within ``radius_m`` matches (e.g. an off-map or badly mismapped
+    goal, or every nearby candidate fails the heading check).
     """
     layers = [SemanticMapLayer.ROADBLOCK, SemanticMapLayer.ROADBLOCK_CONNECTOR]
-    proximal = map_api.get_proximal_map_objects(point=point, radius=radius_m, layers=layers)
-    candidates = proximal[SemanticMapLayer.ROADBLOCK] + proximal[SemanticMapLayer.ROADBLOCK_CONNECTOR]
+    proximal = map_api.get_proximal_map_objects(
+        point=point, radius=radius_m, layers=layers
+    )
+    candidates = (
+        proximal[SemanticMapLayer.ROADBLOCK]
+        + proximal[SemanticMapLayer.ROADBLOCK_CONNECTOR]
+    )
     if not candidates:
         return None
 
@@ -492,41 +539,54 @@ def _roadblock_id_near_point(
             path = lane.baseline_path.discrete_path
             if not path:
                 continue
-            dist = min(math.hypot(p.x - point.x, p.y - point.y) for p in path)
+            nearest = min(
+                path, key=lambda p: (p.x - point.x) ** 2 + (p.y - point.y) ** 2
+            )
+            if (
+                heading is not None
+                and abs(_normalize_angle(nearest.heading - heading)) > heading_thresh
+            ):
+                continue
+            dist = math.hypot(nearest.x - point.x, nearest.y - point.y)
             if dist < best_dist:
                 best_dist, best_id = dist, rb.id
     return best_id
 
 
-def _backward_reachable_set(
+def _backward_distances_to_goal(
     map_api: AbstractMap,
     goal_roadblock_id: str,
-    max_roadblocks: int = 300,
-) -> set:
-    """Roadblock ids that can reach ``goal_roadblock_id`` via forward (``outgoing_edges``) travel.
+    max_roadblocks: int = 30,
+) -> Dict[str, int]:
+    """Hop-distance to ``goal_roadblock_id`` (via forward/``outgoing_edges`` travel) per roadblock.
 
     Found by a bounded BFS *backward* from the goal over ``incoming_edges`` — cheaper than
     searching forward from every fork candidate, since it explores the graph once regardless of
-    how many forks the eventual forward walk passes through. Bounded by ``max_roadblocks`` (same
-    budget as the forward walk) so a goal in a huge or badly-connected local graph can't blow up
-    the search; a goal with no path within that budget simply yields an incomplete set, so the
-    forward walk falls back to its heading-based guess wherever the set doesn't cover a fork.
+    how many forks the eventual forward walk passes through. The returned distances let the
+    forward walk always pick real, verified progress toward the goal (the neighbor with the
+    smallest distance) instead of guessing by heading or stored-route membership alone. Bounded by
+    ``max_roadblocks`` (same budget as the forward walk) so a goal in a huge or badly-connected
+    local graph can't blow up the search; a goal with no path within that budget simply yields an
+    incomplete map, so the forward walk falls back to its heading-based guess wherever a fork
+    isn't covered.
     """
     goal_rb = _get_roadblock(map_api, goal_roadblock_id)
     if goal_rb is None:
-        return set()
+        return {}
 
-    reachable = {goal_roadblock_id}
+    distances = {goal_roadblock_id: 0}
     frontier = [goal_rb]
-    while frontier and len(reachable) < max_roadblocks:
+    depth = 0
+    while frontier and len(distances) < max_roadblocks:
+        depth += 1
         next_frontier = []
         for rb in frontier:
             for pred in getattr(rb, "incoming_edges", None) or []:
-                if pred.id not in reachable:
-                    reachable.add(pred.id)
+                if pred.id not in distances:
+                    distances[pred.id] = depth
                     next_frontier.append(pred)
         frontier = next_frontier
-    return reachable
+    return distances
 
 
 def _ego_current_roadblock(
@@ -735,7 +795,9 @@ def _straightest_extension(
         if lane is None:
             return False
         seg_len = lane.baseline_path.length
-        end_time = cum_time + seg_len / _lane_speed(lane, default_speed_mps, min_speed_mps)
+        end_time = cum_time + seg_len / _lane_speed(
+            lane, default_speed_mps, min_speed_mps
+        )
         end_dist = cum_dist + seg_len
         steps = steps + [_Step(rb, lane, cum_time, end_time, cum_dist, end_dist)]
         if end_time > best_end_time:
@@ -807,7 +869,11 @@ def _build_alternative(
     final = steps[-1]
     remaining_time_s = goal_time_s - final.enter_time
     goal_arc_m = min(
-        max(remaining_time_s * _lane_speed(final.lane, default_speed_mps, min_speed_mps), 0.0),
+        max(
+            remaining_time_s
+            * _lane_speed(final.lane, default_speed_mps, min_speed_mps),
+            0.0,
+        ),
         final.lane.baseline_path.length,
     )
     goal = _pose_at_arc_length(final.lane, goal_arc_m)
@@ -837,7 +903,9 @@ def _branch_misalignment(
     lane = _straightest_lane(rb, ref_lane)
     if lane is None:
         return math.pi
-    return abs(_normalize_angle(lane.baseline_path.discrete_path[0].heading - ref_heading))
+    return abs(
+        _normalize_angle(lane.baseline_path.discrete_path[0].heading - ref_heading)
+    )
 
 
 def _pose_at_arc_length(lane: LaneGraphEdgeMapObject, arc: float) -> Pose:
