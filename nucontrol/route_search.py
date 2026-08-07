@@ -36,6 +36,20 @@ from nuplan.planning.scenario_builder.nuplan_db.nuplan_scenario import NuPlanSce
 # (x, y, heading) goal pose.
 Pose = Tuple[float, float, float]
 
+# How far back the rescue pass may step from the ego's roadblock to find one that can actually
+# reach the goal (see _rescue_route_to_goal). The ego frequently sits on a short junction
+# connector, and nuPlan maps contain connectors that simply dead-end; backing up to the roadblock
+# the ego came from recovers the real route. Kept small so the route can never start far behind
+# the ego (and the couple of metres it may start behind are trimmed downstream anyway, by the
+# ego-position lookups in project_start_to_route_roadblock_midpoint / resolve_current_route_index).
+REANCHOR_MAX_BACKTRACK = 3
+
+# Node budget for the rescue pass's backward search (see _rescue_route_to_goal). Roadblocks are
+# frequently only a few metres long, so spanning a ~250 m gap can take 35+ hops and several
+# hundred nodes; this is sized to cover a local road network comfortably while still bounding a
+# pathological graph. It is pure hop-counting over graph edges, so the cost is negligible.
+RESCUE_MAX_BACKWARD_NODES = 3000
+
 
 def _normalize_angle(angle: float) -> float:
     """Wrap an angle to [-pi, pi)."""
@@ -94,6 +108,13 @@ def extract_original_route(
     - If ``goal`` can't be resolved to any roadblock within ``goal_radius_m`` (e.g. off-map), or no
       connecting path is found within ``max_roadblocks``, this falls back to the plain
       ``goal_time_s``-bounded walk (dead end via ``outgoing_edges`` breaks the loop as before).
+
+    Finally, if the walk above still ended somewhere other than the goal's roadblock, a **rescue
+    pass** (:func:`_rescue_route_to_goal`) retries with a much wider backward search. The narrow
+    ``max_roadblocks`` budget is a *node count*, so in dense areas it is spent on breadth a few
+    hops out and never reaches the ego — leaving every fork uncovered, so the walk follows heading
+    alone and can wander off in an entirely wrong direction. The rescue only ever runs for routes
+    that already failed to reach the goal, so routes that do reach it keep their exact result.
     """
     map_api: AbstractMap = scenario.map_api
     ego_state = scenario.initial_ego_state
@@ -130,6 +151,7 @@ def extract_original_route(
             map_api, goal_roadblock_id, max_roadblocks=max_roadblocks
         )
 
+    start_rb = rb
     route_ids = [rb.id]
     visited = {rb.id}
     prev_lane = _nearest_lane(rb, ego_point)
@@ -192,6 +214,17 @@ def extract_original_route(
 
         if nxt.id == goal_roadblock_id:
             break
+
+    if goal_roadblock_id is not None and route_ids[-1] != goal_roadblock_id:
+        # The walk did not reach the goal (see docstring: the narrow node-count budget above is
+        # typically exhausted by breadth long before it reaches the ego). Retry with a wide
+        # backward search; only routes that already failed get here, so this cannot change a
+        # route that did reach its goal.
+        rescued = _rescue_route_to_goal(
+            map_api, start_rb, ego_point, goal_roadblock_id, stored_set
+        )
+        if rescued is not None:
+            return rescued
 
     return route_ids
 
@@ -587,6 +620,105 @@ def _backward_distances_to_goal(
                     next_frontier.append(pred)
         frontier = next_frontier
     return distances
+
+
+def _nearest_ancestor_reaching_goal(
+    start_rb: RoadBlockGraphEdgeMapObject,
+    distances: Dict[str, int],
+    max_backtrack: int = REANCHOR_MAX_BACKTRACK,
+) -> Optional[RoadBlockGraphEdgeMapObject]:
+    """Closest roadblock *behind* ``start_rb`` that appears in ``distances``. ``None`` if none.
+
+    Breadth-first over ``incoming_edges``, so the returned roadblock is the fewest hops behind the
+    ego, i.e. the one that starts the route as close to the ego as possible while still being able
+    to reach the goal.
+    """
+    frontier = [start_rb]
+    seen = {start_rb.id}
+    for _ in range(max_backtrack):
+        next_frontier = []
+        for rb in frontier:
+            for pred in getattr(rb, "incoming_edges", None) or []:
+                if pred.id in seen:
+                    continue
+                seen.add(pred.id)
+                if pred.id in distances:
+                    return pred
+                next_frontier.append(pred)
+        frontier = next_frontier
+    return None
+
+
+def _rescue_route_to_goal(
+    map_api: AbstractMap,
+    start_rb: RoadBlockGraphEdgeMapObject,
+    ego_point: Point2D,
+    goal_roadblock_id: str,
+    stored_set: set,
+    max_backward_nodes: int = RESCUE_MAX_BACKWARD_NODES,
+) -> Optional[List[str]]:
+    """Walk ego -> goal by descending a wide backward hop-distance field. ``None`` if unreachable.
+
+    Used only as a fallback for routes the main walk failed to connect to the goal. It re-runs
+    :func:`_backward_distances_to_goal` with a budget large enough to actually span the gap
+    (roadblocks are often only a few metres long, so a goal ~100 m away can sit 20+ hops out), then
+    steps to a neighbour with a strictly smaller distance every iteration. Because the distance
+    field is an exact BFS result, such a neighbour always exists until the goal is reached, so this
+    terminates in exactly ``distances[start_rb.id]`` steps and is guaranteed to arrive — no
+    ``max_roadblocks`` cap needed, and no revisit check (the distance strictly decreases).
+
+    If the ego's own roadblock reaches nothing (it is often a short junction connector, and nuPlan
+    maps contain connectors that dead-end outright), the walk is re-anchored a few hops back via
+    :func:`_nearest_ancestor_reaching_goal` before descending.
+
+    Deliberately kept to hop counts over ``incoming_edges``/``outgoing_edges``: it never touches
+    ``baseline_path``, so it costs a few thousand dict operations rather than forcing lane geometry
+    to be built. Among equally-close neighbours the stored route wins, then the straightest branch,
+    so the rescued route still tracks what the ego actually drove wherever that is consistent with
+    reaching the goal.
+    """
+    distances = _backward_distances_to_goal(
+        map_api, goal_roadblock_id, max_roadblocks=max_backward_nodes
+    )
+    remaining = distances.get(start_rb.id)
+    if remaining is None:
+        # Nothing forward of the ego's roadblock reaches the goal. Usually the ego is sitting on a
+        # short junction connector that dead-ends in the map data, while the roadblock it came from
+        # is on a perfectly good route — so step back to the nearest ancestor that does reach the
+        # goal rather than giving up.
+        start_rb = _nearest_ancestor_reaching_goal(start_rb, distances)
+        if start_rb is None:
+            # A genuine map connectivity gap, not a bad anchor — nothing to rescue.
+            return None
+        remaining = distances[start_rb.id]
+
+    route_ids = [start_rb.id]
+    rb = start_rb
+    prev_lane = _nearest_lane(rb, ego_point)
+    while rb.id != goal_roadblock_id:
+        closer = [
+            e for e in rb.outgoing_edges if distances.get(e.id, remaining) < remaining
+        ]
+        if not closer:
+            return None
+        best = min(distances[e.id] for e in closer)
+        tied = [e for e in closer if distances[e.id] == best]
+        on_route = [e for e in tied if e.id in stored_set]
+        pool = on_route or tied
+        if prev_lane is None:
+            nxt = pool[0]
+        else:
+            ref_heading = prev_lane.baseline_path.discrete_path[-1].heading
+            nxt = min(
+                pool, key=lambda e: _branch_misalignment(e, prev_lane, ref_heading)
+            )
+        lane = _straightest_lane(nxt, prev_lane)
+        if lane is None:
+            return None
+        route_ids.append(nxt.id)
+        rb, prev_lane, remaining = nxt, lane, distances[nxt.id]
+
+    return route_ids
 
 
 def _ego_current_roadblock(
