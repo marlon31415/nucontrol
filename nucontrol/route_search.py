@@ -444,7 +444,7 @@ def search_alternative_routes(
         if alt is None:
             continue
         alternatives.append(alt)
-        seen_finals.add(alt.route_ids[-1])
+        seen_finals.add(alt.route_roadblock_ids[-1])
         level1.append((first_div.prefix_ids, steps))
 
     # --- Level 2 (fill only): if the first junction gave fewer than max_alternatives, top up from
@@ -485,10 +485,10 @@ def search_alternative_routes(
                     min_speed_mps=min_speed_mps,
                     min_goal_time_s=min_goal_time_s,
                 )
-                if alt2 is None or alt2.route_ids[-1] in seen_finals:
+                if alt2 is None or alt2.route_roadblock_ids[-1] in seen_finals:
                     continue
                 alternatives.append(alt2)
-                seen_finals.add(alt2.route_ids[-1])
+                seen_finals.add(alt2.route_roadblock_ids[-1])
 
     return alternatives
 
@@ -1013,7 +1013,7 @@ def _build_alternative(
     ext_ids = [s.rb.id for s in steps]
     return AlternativeRoute(
         token=token,
-        route_ids=list(prefix_ids) + ext_ids,
+        route_roadblock_ids=list(prefix_ids) + ext_ids,
         goal_position=goal,
         meta={
             "divergence_distance_m": round(divergence_distance_m, 2),

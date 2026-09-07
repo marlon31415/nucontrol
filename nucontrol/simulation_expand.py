@@ -56,7 +56,7 @@ def expand_scenarios_with_alternatives(
             expanded.append(
                 change_routing(
                     scenario,
-                    route_ids=alt.route_ids,
+                    route_roadblock_ids=alt.route_roadblock_ids,
                     goal_position=alt.goal_position,
                     scenario_name=f"{scenario.token}_alt{i}",
                     alt_goal_distance_m=alt.meta.get("goal_distance_m"),

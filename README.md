@@ -19,7 +19,7 @@ Each JSONL row has the shape:
 ```json
 {
   "token": "<scenario_token>",
-  "route_ids": ["<roadblock_id>", "..."],
+  "route_roadblock_ids": ["<roadblock_id>", "..."],
   "goal_position": [x, y, heading],
   "meta": {
     "divergence_distance_m": 21.5,
@@ -114,9 +114,11 @@ from nucontrol import load_scenario, search_alternative_routes, change_routing
 
 scenario = load_scenario(token)
 alt = search_alternative_routes(scenario)[0]
-rerouted = change_routing(scenario, route_ids=alt.route_ids, goal_position=alt.goal_position)
+rerouted = change_routing(
+    scenario, route_roadblock_ids=alt.route_roadblock_ids, goal_position=alt.goal_position
+)
 
-rerouted.get_route_roadblock_ids()  # -> alt.route_ids
+rerouted.get_route_roadblock_ids()  # -> alt.route_roadblock_ids
 rerouted.get_mission_goal()         # -> StateSE2 at alt.goal_position
 ```
 

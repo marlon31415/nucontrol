@@ -128,7 +128,7 @@ def _candidate_tokens() -> List[str]:
 
 def _route_key(alt) -> Tuple[str, ...]:
     """Identity of an alternative route for set comparison (its roadblock-id sequence)."""
-    return tuple(alt.route_ids)
+    return tuple(alt.route_roadblock_ids)
 
 
 def _find_biting_token(loader, base_kwargs) -> Optional[dict]:
@@ -215,7 +215,7 @@ def _draw_panel(ax, scenario, alternatives, dropped_keys, title, view) -> None:
     for i, alt in enumerate(alternatives):
         color = _ALT_COLORS[i % len(_ALT_COLORS)]
         is_dropped = _route_key(alt) in dropped_keys
-        for lane in route_lanes(map_api, alt.route_ids):
+        for lane in route_lanes(map_api, alt.route_roadblock_ids):
             xy = _exterior_xy(lane.polygon)
             if xy is None:
                 continue
@@ -282,7 +282,7 @@ def _shared_view(scenario, variants, pad_m: float = 25.0):
     ys: List[float] = [ego.y]
     for alts in variants:
         for alt in alts:
-            for lane in route_lanes(map_api, alt.route_ids):
+            for lane in route_lanes(map_api, alt.route_roadblock_ids):
                 xy = _exterior_xy(lane.polygon)
                 if xy is not None:
                     xs.extend(xy[0])

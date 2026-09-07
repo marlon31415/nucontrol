@@ -96,9 +96,9 @@ def test_generate_dataset():
     print(f"\nWrote {n} alternative route(s) to {out_path}")
     for row in rows:
         assert row.token == DEFAULT_TOKEN
-        assert len(row.route_ids) >= 1
+        assert len(row.route_roadblock_ids) >= 1
         # Every roadblock id must resolve on the map (route is well-formed).
-        for rid in row.route_ids:
+        for rid in row.route_roadblock_ids:
             rb = map_api.get_map_object(
                 rid, SemanticMapLayer.ROADBLOCK
             ) or map_api.get_map_object(rid, SemanticMapLayer.ROADBLOCK_CONNECTOR)
@@ -106,7 +106,7 @@ def test_generate_dataset():
         assert len(row.goal_position) == 3
         assert set(row.meta) >= {"divergence_distance_m", "goal_distance_m", "turn"}
         print(
-            f"  {row.meta['turn']:>8}  {len(row.route_ids):>2} roadblocks  "
+            f"  {row.meta['turn']:>8}  {len(row.route_roadblock_ids):>2} roadblocks  "
             f"goal_dist={row.meta['goal_distance_m']:.0f}m  "
             f"t={row.meta['est_travel_time_s']:.0f}s "
             f"({'reached' if row.meta['reached_goal_time'] else 'short'})"

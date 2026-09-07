@@ -311,7 +311,7 @@ def visualize_token(
             f"goal {m['goal_distance_m']}m / {m['est_travel_time_s']}s"
             f"{'' if m['reached_goal_time'] else ' (short)'}"
         )
-        plot_route(scenario, alt.route_ids, alt.goal_position, title, p)
+        plot_route(scenario, alt.route_roadblock_ids, alt.goal_position, title, p)
         written.append(p)
 
     return written

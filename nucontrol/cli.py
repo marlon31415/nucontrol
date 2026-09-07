@@ -220,7 +220,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 print(
                     f"{token}: {r.meta.get('turn')} div@{r.meta.get('divergence_distance_m')}m "
                     f"t~{r.meta.get('est_travel_time_s')}s "
-                    f"{len(r.route_ids)} roadblocks goal=({gx:.1f},{gy:.1f},{gh:.2f})"
+                    f"{len(r.route_roadblock_ids)} roadblocks goal=({gx:.1f},{gy:.1f},{gh:.2f})"
                 )
 
     n = write_alternative_routes(all_routes, output, append=append)

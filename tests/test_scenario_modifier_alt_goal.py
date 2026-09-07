@@ -27,7 +27,7 @@ class TestAltGoalDistance(unittest.TestCase):
         self.assertIsNone(s.alt_goal_distance_m)
 
     def test_change_routing_threads_the_value(self) -> None:
-        s = change_routing(_DummyScenario(), route_ids=["a", "b"], alt_goal_distance_m=5.0)
+        s = change_routing(_DummyScenario(), route_roadblock_ids=["a", "b"], alt_goal_distance_m=5.0)
         self.assertEqual(s.alt_goal_distance_m, 5.0)
 
     def test_getattr_on_plain_scenario_is_none(self) -> None:

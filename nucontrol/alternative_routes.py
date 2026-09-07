@@ -19,14 +19,15 @@ class AlternativeRoute:
 
     Attributes:
         token: The scenario token this alternative belongs to.
-        route_ids: Ordered roadblock (lane-group) ids describing the alternative route.
+        route_roadblock_ids: Ordered roadblock (lane-group) ids describing the alternative
+            route. Named to match nuPlan's ``scenario.get_route_roadblock_ids()``.
         goal_position: The new goal / mission-goal pose as ``(x, y, heading)`` in the
             global map frame.
         meta: Optional free-form metadata (e.g. length, search strategy, original goal).
     """
 
     token: str
-    route_ids: List[str]
+    route_roadblock_ids: List[str]
     goal_position: Tuple[float, float, float]
     meta: dict = field(default_factory=dict)
 
@@ -40,7 +41,8 @@ class AlternativeRoute:
     def from_json_dict(cls, d: dict) -> "AlternativeRoute":
         return cls(
             token=d["token"],
-            route_ids=list(d["route_ids"]),
+            # ``route_ids`` is the pre-rename key; datasets written before the rename.
+            route_roadblock_ids=list(d.get("route_roadblock_ids", d.get("route_ids", []))),
             goal_position=tuple(d["goal_position"]),  # type: ignore[arg-type]
             meta=d.get("meta", {}),
         )

@@ -18,8 +18,12 @@ Usage::
 
     scenario = load_scenario(token)
     alt = search_alternative_routes(scenario)[0]
-    rerouted = change_routing(scenario, route_ids=alt.route_ids, goal_position=alt.goal_position)
-    # rerouted.get_route_roadblock_ids() -> alt.route_ids
+    rerouted = change_routing(
+        scenario,
+        route_roadblock_ids=alt.route_roadblock_ids,
+        goal_position=alt.goal_position,
+    )
+    # rerouted.get_route_roadblock_ids() -> alt.route_roadblock_ids
     # rerouted.get_mission_goal()        -> StateSE2 at alt.goal_position
 """
 
@@ -126,16 +130,18 @@ class ModifiedRoutingScenario:
 
 def change_routing(
     scenario: AbstractScenario,
-    route_ids: Optional[Sequence[str]] = None,
+    route_roadblock_ids: Optional[Sequence[str]] = None,
     goal_position: Optional[Pose] = None,
     scenario_name: Optional[str] = None,
     alt_goal_distance_m: Optional[float] = None,
+    route_ids: Optional[Sequence[str]] = None,
 ) -> ModifiedRoutingScenario:
     """Return a rerouted view of ``scenario`` with a new route and/or mission goal.
 
     Args:
         scenario: A loaded nuPlan scenario (e.g. from :func:`load_scenario`).
-        route_ids: New ordered roadblock ids for the route. If ``None``, the original route is kept.
+        route_roadblock_ids: New ordered roadblock ids for the route. If ``None``, the original
+            route is kept.
         goal_position: New mission goal as ``(x, y, heading)`` or a ``StateSE2``. If ``None``, the
             original mission goal is kept.
         scenario_name: Optional unique name for the rerouted view. Use this when several
@@ -143,14 +149,21 @@ def change_routing(
             ``scenario_name``) do not overwrite each other. If ``None``, the original name is kept.
         alt_goal_distance_m: Planned distance [m] of this alternative route to its goal, exposed to
             the ego-progress metric as a reference. If ``None``, the metric keeps its expert path.
+        route_ids: Deprecated alias for ``route_roadblock_ids``, kept so callers written before the
+            rename keep working.
 
     Returns:
         A :class:`ModifiedRoutingScenario` drop-in that reports the new route/goal but otherwise
         behaves identically to ``scenario`` (safe to pass to the planner / simulation).
     """
+    if route_ids is not None:
+        if route_roadblock_ids is not None:
+            raise TypeError("pass either route_roadblock_ids or its deprecated alias route_ids, not both")
+        route_roadblock_ids = route_ids
+
     return ModifiedRoutingScenario(
         scenario,
-        route_roadblock_ids=route_ids,
+        route_roadblock_ids=route_roadblock_ids,
         mission_goal=goal_position,
         scenario_name=scenario_name,
         alt_goal_distance_m=alt_goal_distance_m,
