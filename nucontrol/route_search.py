@@ -440,6 +440,7 @@ def search_alternative_routes(
             default_speed_mps=default_speed_mps,
             min_speed_mps=min_speed_mps,
             min_goal_time_s=min_goal_time_s,
+            level=1,
         )
         if alt is None:
             continue
@@ -484,6 +485,7 @@ def search_alternative_routes(
                     default_speed_mps=default_speed_mps,
                     min_speed_mps=min_speed_mps,
                     min_goal_time_s=min_goal_time_s,
+                    level=2,
                 )
                 if alt2 is None or alt2.route_roadblock_ids[-1] in seen_finals:
                     continue
@@ -982,6 +984,7 @@ def _build_alternative(
     default_speed_mps: float,
     min_speed_mps: float,
     min_goal_time_s: float,
+    level: int,
 ):
     """Assemble an :class:`AlternativeRoute` from a prefix + extension, or ``None`` if unusable.
 
@@ -989,6 +992,10 @@ def _build_alternative(
     distance to it is the distance up to that lane plus that in-lane arc. Reaching ~``goal_time_s``
     is a *soft* target: shorter paths are still emitted (tagged ``reached_goal_time=False``); the
     ``min_goal_time_s`` guard (0 by default) only trims trivially short spurs when raised.
+
+    ``level`` records which search stage produced this alternative: 1 for the first junction ahead
+    of the ego, 2 for a fill from the next junction along an already-found alternative. Recorded in
+    ``meta`` so consumers can select on it instead of re-deriving it from ``max_alternatives``.
     """
     from .alternative_routes import AlternativeRoute
 
@@ -1022,6 +1029,7 @@ def _build_alternative(
             "reached_goal_time": bool(total_time_s >= goal_time_s),
             "turn": _turn_label(junction_lane, branch),
             "num_roadblocks": len(prefix_ids) + len(ext_ids),
+            "level": int(level),
         },
     )
 

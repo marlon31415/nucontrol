@@ -8,7 +8,7 @@ dataset:
   # The demo token lives in trainval; pin it so the tests are deterministic regardless of any
   # NUCONTROL_SPLITS environment variable. (Ignored when NUPLAN_DATA_ROOT is a single split dir.)
   splits: [trainval]
-  scan_threads: 64
+  max_workers: 64
   extraction_offset: -3.0
 
 # --- Alternative-route search ---

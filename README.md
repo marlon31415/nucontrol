@@ -27,7 +27,8 @@ Each JSONL row has the shape:
     "est_travel_time_s": 60.0,
     "reached_goal_time": true,
     "turn": "left",
-    "num_roadblocks": 17
+    "num_roadblocks": 17,
+    "level": 1
   }
 }
 ```
@@ -39,6 +40,8 @@ Each JSONL row has the shape:
   dead-ending. The 1-min goal is a *soft* target: shorter branches are still emitted with their
   achievable distance/time recorded here.
 - `turn` — `left` / `right` / `straight` relative to the original route at the divergence.
+- `level` — `1` if the divergence is the first junction ahead of the ego, `2` if it is a fill
+  from the next junction along an already-found alternative (see below).
 
 Later, during FlowDrive inference, this file is read to override the mission goal / route
 and simulate the ego driving the alternative route.

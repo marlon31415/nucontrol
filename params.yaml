@@ -24,13 +24,18 @@ dataset:
   # NUCONTROL_SPLITS env var if set, else "trainval" (the official split holding val14). The
   # official dataset ships only trainval and test; use ["test"] for test14, ["mini"] for mini.
   splits: null            # e.g. [trainval]  or  [test]
+  # Official log-name split to restrict the scan to (nucontrol/data/nuplan_<split>.json).
+  # nuPlan only opens a log DB whose name is in this list, so this is what keeps loading fast:
+  # "val" opens ~1.4k logs instead of ~14.5k. Use "train" to generate for the training split.
+  log_split: val          # train | val | test
   # Threads for the one-time token-location scan (I/O-bound on opening the split's log DBs).
-  scan_threads: 64
+  max_workers: 64
   # Scenario extraction offset [s] applied when loading a token. The loaded initial ego pose sits at
   # anchor + extraction_offset, and the alt route is searched from that pose. Set to -3.0 to match the
   # nuPlan simulation builders (nuplan_eval / nuplan_challenge), whose val14
   # scenarios also load at -3.0 — so the alt route is searched from the exact pose the planner starts
   # at (3s before the tagged token, giving run-up).
+  # NOTE: set this to 0.0 when generating routes for *training* data
   extraction_offset: -3.0
 
 # --- Alternative-route search -----------------------------------------------------------------

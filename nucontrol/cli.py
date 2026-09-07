@@ -82,7 +82,19 @@ def build_parser() -> argparse.ArgumentParser:
         "--splits", nargs="+", default=None, help="Split subdir(s) to search, e.g. trainval or test."
     )
     parser.add_argument(
-        "--scan-threads", type=int, default=None, help="Threads for the token-location scan."
+        "--scan-threads", type=int, default=None,
+        help="Threads for the token-location scan (ScenarioLoader max_workers).",
+    )
+    parser.add_argument(
+        "--log-split", default=None, choices=("train", "val", "test"),
+        help="Official log-name split to restrict the scan to (nucontrol/data/nuplan_<split>.json). "
+             "nuPlan only opens a log DB whose name is in this list, so picking the right split is "
+             "what keeps loading fast. Default: val.",
+    )
+    parser.add_argument(
+        "--extraction-offset", type=float, default=None,
+        help="Scenario extraction offset (s) applied when loading a token. -3.0 matches the nuPlan "
+             "simulation builders; use 0.0 to match the FlowDrive data-processing pipeline.",
     )
 
     # Alternative-route search.
@@ -174,7 +186,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         map_root=args.map_root,
         map_version=args.map_version,
         splits=args.splits,
-        scan_threads=args.scan_threads,
+        log_split=args.log_split,
+        max_workers=args.scan_threads,
+        extraction_offset=args.extraction_offset,
     )
     kwargs = search_kwargs(
         config,
